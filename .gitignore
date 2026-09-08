@@ -1,0 +1,28 @@
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
+npm-debug.log*
+
+# 依赖（本项目无 npm 依赖，保留通用忽略）
+node_modules/
+
+# 临时文件
+*.tmp
+*.temp
+*.crx
+*.zip
+
+# 本地调试
+test-*.js
+gen_content.py
+.jshintrc
