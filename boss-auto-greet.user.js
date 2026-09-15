@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 · 定向自动沟通助手
 // @namespace    doubao-boss-auto-greet
-// @version      1.5.1
+// @version      1.5.2
 // @description  在 BOSS 直聘职位搜索结果页，按关键词/排除词/公司筛选岗位，逐个进入职位详情页点「立即沟通」，在聊天页自动填写并发送自定义招呼语（Enter 发送），然后返回初始筛选列表继续下一个。整页投完再翻页、投过自动去重、配置本地保存。
 // @author       doubao
 // @match        *://www.zhipin.com/*
@@ -20,6 +20,8 @@
  * 3. 请先登录 BOSS 直聘，搜索就业方向进入「搜索结果列表页」，在右下角悬浮面板配置后点【开始】。
  * 4. 平台每日沟通有数量限制（一般 80~100 次），脚本默认每轮上限 30 次、随机间隔 8~15 秒，可自行下调。
  *
+ * v1.5.2 新增地区过滤：自动读取页面所选城市（如珠海），只与该地区职位沟通，自动跳过其他城市；
+ *    面板可手动指定允许地区（留空=跟随页面城市）。同时修正列表卡片地区(.company-location)与公司名(.boss-name)选择器。
  * v1.5.1 修复：记录原始筛选页时补全 query（职位方向），发送完带时间戳整页跳回并刷新出新职位
  *  - 聊天输入框：<div contenteditable="true" id="chat-input" class="chat-input">，位于主文档
  *    .chat-conversation .message-controls .chat-im.chat-editor .editor-container 内（不在 iframe）。
@@ -44,6 +46,7 @@
     keywords: ['java'],              // 职位名称需包含以下任一关键词（不区分大小写）
     excludeKeywords: ['外包', '驻场', '外派', '资深', '高级', '实习', '应届'], // 职位名称含任一即跳过
     excludeCompanies: [],            // 公司名含任一即跳过（如 ['中软国际','德科']）
+    areas: [],                       // 限定地区：只与这些地区的岗位沟通；空数组=自动读取页面所选城市
     message: '您好！我看到贵司在招 {jobName}，我对这个岗位非常感兴趣，有相关的项目经验，希望有机会和您进一步沟通。', // 支持 {jobName} {company} {salary} 占位符
     minDelaySec: 8,                  // 每两个岗位之间的最小间隔（秒，最低 1）
     maxDelaySec: 15,                 // 每两个岗位之间的最大间隔（秒）
@@ -59,9 +62,9 @@
   const SEL = {
     card: ['.job-card-wrapper', '.job-card-box', '.job-list-box li', 'li[class*="job-card"]'],
     title: ['.job-name', '[class*="job-name"]', '.job-title', '.job-card-title'],
-    company: ['.company-name', '[class*="company-name"]'],
+    company: ['.boss-name', '[class*="boss-name"]', '.company-name', '[class*="company-name"]'],
     salary: ['.salary', '[class*="salary"]'],
-    area: ['.job-area', '[class*="job-area"]'],
+    area: ['.company-location', '[class*="company-location"]', '.job-area', '[class*="job-area"]'],
     liveness: ['.boss-info .name', '[class*="boss-info"] .name', '.info-public', '[class*="liveness"]'],
     detailLink: ['a[href*="/job_detail/"]', 'a[href*="job_detail"]'],
     chatBtnSel: ['.op-btn-chat', '.op-btn.op-btn-chat', '[class*="start-chat"]', '[class*="btn-chat"]', '.btn-startchat'],
@@ -199,6 +202,21 @@
     return '';
   }
 
+  // 读取页面顶部当前所选城市（真机：.cur-city-label / .city-label.active，文本如「珠海」）
+  function readSelectedCity() {
+    var sels = ['.cur-city-label', '.city-label.active', '.city-label', '[class*="current-city"]', '[class*="cur-city"]'];
+    for (var i = 0; i < sels.length; i++) {
+      var el = $(sels[i]);
+      if (!el) continue;
+      var t = norm(el.innerText || el.textContent);
+      // 去掉定位图标残留、下拉箭头、末尾「市」、空白
+      t = t.replace(/[▾▼∨▲▴\s]/g, '').replace(/市$/, '');
+      // 只保留城市名主体（形如「珠海」「中山」，避免取到整行筛选条）
+      if (t && t.length <= 8 && !/工作区域|职位类型|求职类型|薪资|工作经验|公司/.test(t)) return t;
+    }
+    return '';
+  }
+
   // 规范化「原始筛选页」URL：确保带 query（职位方向），删除一次性签名/分页参数，保证整页跳回能恢复同样的筛选而不是落到推荐页
   function buildOriginUrl(fallbackKw) {
     try {
@@ -226,7 +244,7 @@
     return {
       running: false, paused: false, queue: [], page: 1,
       returnUrl: '', originUrl: '', greetedThisRun: 0, stopReason: '',
-      currentJobId: null, phase: '', errorStreak: 0
+      currentJobId: null, phase: '', errorStreak: 0, allowAreas: []
     };
   }
   function getState() { return Object.assign(defaultState(), lsGet(LS_STATE, {})); }
@@ -254,6 +272,7 @@
     if (pc.keywords && pc.keywords.length) c.keywords = pc.keywords;
     if (pc.excludeKeywords) c.excludeKeywords = pc.excludeKeywords;
     if (pc.excludeCompanies) c.excludeCompanies = pc.excludeCompanies;
+    if (pc.areas) c.areas = pc.areas;
     if (pc.message) c.message = pc.message;
     if (pc.maxPerRun) c.maxPerRun = Number(pc.maxPerRun);
     if (pc.minDelaySec != null) c.minDelaySec = Number(pc.minDelaySec);
@@ -298,6 +317,8 @@
       '<input id="bgp-exk" style="border:1px solid #dcdfe6;border-radius:6px;padding:4px 6px;" placeholder="外包,驻场,外派"/></label>' +
       '<label style="display:flex;flex-direction:column;gap:2px;">屏蔽公司（公司名含任一即跳过，逗号分隔）' +
       '<input id="bgp-exc" style="border:1px solid #dcdfe6;border-radius:6px;padding:4px 6px;" placeholder="中软国际,德科"/></label>' +
+      '<label style="display:flex;flex-direction:column;gap:2px;">限定地区（只投这些城市，逗号分隔；留空=自动只投页面所选城市）' +
+      '<input id="bgp-area" style="border:1px solid #dcdfe6;border-radius:6px;padding:4px 6px;" placeholder="留空自动读取，如 珠海 或 珠海,中山"/></label>' +
       '<label style="display:flex;flex-direction:column;gap:2px;">招呼语（支持 {jobName} {company} {salary}）' +
       '<textarea id="bgp-msg" rows="3" style="border:1px solid #dcdfe6;border-radius:6px;padding:4px 6px;resize:vertical;"></textarea></label>' +
       '<label style="display:flex;align-items:center;gap:6px;">本轮上限' +
@@ -318,6 +339,7 @@
     div.querySelector('#bgp-kw').value = (pc.keywords && pc.keywords.length ? pc.keywords : CONFIG.keywords).join(',');
     div.querySelector('#bgp-exk').value = (pc.excludeKeywords && pc.excludeKeywords.length ? pc.excludeKeywords : CONFIG.excludeKeywords).join(',');
     div.querySelector('#bgp-exc').value = (pc.excludeCompanies && pc.excludeCompanies.length ? pc.excludeCompanies : CONFIG.excludeCompanies).join(',');
+    div.querySelector('#bgp-area').value = (pc.areas && pc.areas.length ? pc.areas : CONFIG.areas).join(',');
     div.querySelector('#bgp-msg').value = pc.message || CONFIG.message;
     div.querySelector('#bgp-max').value = pc.maxPerRun || CONFIG.maxPerRun;
     div.querySelector('#bgp-min').value = (pc.minDelaySec != null ? pc.minDelaySec : CONFIG.minDelaySec);
@@ -330,6 +352,7 @@
         keywords: (divVal('bgp-kw') || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean),
         excludeKeywords: (divVal('bgp-exk') || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean),
         excludeCompanies: (divVal('bgp-exc') || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean),
+        areas: (divVal('bgp-area') || '').split(/[,，]/).map(function (s) { return s.trim().replace(/市$/, ''); }).filter(Boolean),
         message: (divVal('bgp-msg') || '').trim(),
         maxPerRun: Number(divVal('bgp-max')) || null,
         minDelaySec: Number(divVal('bgp-min')) || null,
@@ -337,7 +360,7 @@
       };
       lsSet(LS_PANEL, data);
     }
-    ['bgp-kw', 'bgp-exk', 'bgp-exc', 'bgp-msg', 'bgp-max', 'bgp-min', 'bgp-maxd'].forEach(function (id) {
+    ['bgp-kw', 'bgp-exk', 'bgp-exc', 'bgp-area', 'bgp-msg', 'bgp-max', 'bgp-min', 'bgp-maxd'].forEach(function (id) {
       var el = div.querySelector('#' + id);
       if (el && el.addEventListener) {
         el.addEventListener('input', savePanelInputs);
@@ -368,7 +391,7 @@
     else if (kind === '职位详情页' || kind === '聊天页') setPanelStatus('就绪 · 当前在详情/聊天页，请回到搜索结果页点【开始】');
     else if (kind === '登录页') setPanelStatus('⚠ 未登录：请先登录 BOSS 直聘');
     else setPanelStatus('就绪 · 请登录后搜索岗位，进入搜索结果页');
-    log('脚本已加载 v1.5.1 · 当前：' + kind + ' · ' + location.pathname);
+    log('脚本已加载 v1.5.2 · 当前：' + kind + ' · ' + location.pathname);
   }
 
   function buildBanner() {
@@ -398,14 +421,20 @@
     var maxDelaySec = Math.max(minDelaySec, parseInt(divVal('bgp-maxd'), 10) || CONFIG.maxDelaySec);
     var exk = (divVal('bgp-exk') || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean);
     var exc = (divVal('bgp-exc') || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean);
-    lsSet(LS_PANEL, { keywords: kw, excludeKeywords: exk, excludeCompanies: exc, message: msg, maxPerRun: maxPerRun, minDelaySec: minDelaySec, maxDelaySec: maxDelaySec });
+    var areaInput = (divVal('bgp-area') || '').split(/[,，]/).map(function (s) { return s.trim().replace(/市$/, ''); }).filter(Boolean);
+    // 生效地区：面板手动填了用面板；留空则自动读取页面顶部所选城市，只投该城市岗位
+    var allowAreas = areaInput.slice();
+    if (!allowAreas.length) { var city = readSelectedCity(); if (city) allowAreas = [city]; }
+    lsSet(LS_PANEL, { keywords: kw, excludeKeywords: exk, excludeCompanies: exc, areas: areaInput, message: msg, maxPerRun: maxPerRun, minDelaySec: minDelaySec, maxDelaySec: maxDelaySec });
     var s = defaultState();
     s.running = true; s.phase = 'list'; s.page = 1;
+    s.allowAreas = allowAreas;
     // 记录初始筛选页（含地点/类别/查询参数），发送完成后回到这里而不是默认推荐页
     s.originUrl = buildOriginUrl(kw[0]);
     s.returnUrl = s.originUrl;
     saveState(s);
     log('已记录原始筛选页：' + s.originUrl);
+    log(allowAreas.length ? '限定地区：[' + allowAreas.join(',') + ']，其他城市岗位自动跳过' : '未读取到所选城市，本次不限定地区（可在面板手动填写）');
     log('▶ 开始：关键词 [' + kw.join(',') + '] 本轮上限 ' + maxPerRun + '，间隔 ' + minDelaySec + '-' + maxDelaySec + 's');
     setPanelStatus('运行中…');
     runListLoop();
@@ -468,6 +497,17 @@
     if (m2) return { min: +m2[1], max: 999 };
     return null;
   }
+  // 地区匹配：卡片地区文本（如「珠海·香洲区·前山」）或职位标题（如「xx（广州）」）含任一允许城市即通过
+  function areaMatch(p, areas) {
+    if (!areas || !areas.length) return true; // 未限定地区时不拦截
+    var area = String(p.area || '').toLowerCase();
+    var title = String(p.title || '').toLowerCase();
+    return areas.some(function (a) {
+      a = String(a || '').trim().toLowerCase();
+      if (!a) return true;
+      return area.indexOf(a) !== -1 || title.indexOf(a) !== -1;
+    });
+  }
   function matchJob(card, cfg) {
     var p = parseCard(card);
     if (!p.id || !p.href) return null;
@@ -478,6 +518,7 @@
     if (!cfg.keywords.some(function (k) { return t.indexOf(String(k).toLowerCase()) !== -1; })) return null;
     if (cfg.excludeKeywords.some(function (k) { return t.indexOf(String(k).toLowerCase()) !== -1; })) return null;
     if (cfg.excludeCompanies.some(function (c) { return p.company.toLowerCase().indexOf(String(c).toLowerCase()) !== -1; })) return null;
+    if (!areaMatch(p, cfg.areas)) return null;
     if (cfg.salaryRange) {
       var r = parseSalary(p.salary);
       if (!r || !(r.max >= cfg.salaryRange[0] && r.min <= cfg.salaryRange[1])) return null;
@@ -497,6 +538,7 @@
     if (_busy) return;
     var cfg = effectiveCfg();
     var state = getState();
+    cfg.areas = state.allowAreas || []; // 本次运行的限定地区（开始时按面板/页面城市确定）
     if (!state.running || state.paused) return;
     if (state.phase === 'detail' || state.phase === 'chat' || state.phase === 'awaiting-chat') return; // 正在处理某个岗位，列表不抢调度
     _busy = true;
@@ -521,16 +563,21 @@
 
       // 2) 队列清空才扫描当前页并入队（整页匹配项一次性快照，避免投一个就刷新漏掉其余）
       if (!pending) {
-        var cards = collectCards(), added = 0;
+        var cards = collectCards(), added = 0, skippedArea = 0;
         for (var mi = 0; mi < cards.length; mi++) {
+          var pre = parseCard(cards[mi]);
           var p = matchJob(cards[mi], cfg);
-          if (!p) continue;
+          if (!p) {
+            if (pre && pre.id && pre.area && cfg.areas.length && !areaMatch(pre, cfg.areas)) skippedArea++;
+            continue;
+          }
           if (queueHasId(state, p.id)) continue;
           p.done = false; state.queue.push(p); added++;
         }
         state.errorStreak = 0;
         saveState(state);
         log('本页扫描 ' + cards.length + ' 条，新匹配 ' + added + ' 条，队列待处理 ' + state.queue.filter(function (e) { return !e.done; }).length + ' 条');
+        if (skippedArea) log('已跳过 ' + skippedArea + ' 个非[' + cfg.areas.join('/') + ']地区的岗位');
         for (i = 0; i < state.queue.length; i++) if (!state.queue[i].done) { pending = state.queue[i]; break; }
       }
 
