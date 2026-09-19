@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BOSS直聘 · 定向自动沟通助手
 // @namespace    doubao-boss-auto-greet
-// @version      1.5.4
-// @description  在 BOSS 直聘职位列表页（搜索结果页 / 推荐页的求职期望方向 tab），按关键词/排除词/公司/地区筛选岗位，自动持续下滑加载该方向全部职位（最多数百个），逐个进入职位详情页点「立即沟通」，在聊天页自动填写并发送自定义招呼语（Enter 发送），发送后自动切回开始时记录的方向与城市继续下一个，投过自动去重、配置本地保存。
+// @version      1.6.0
+// @description  在 BOSS 直聘职位列表页（搜索结果页 / 推荐页的求职期望方向 tab），按关键词/排除词/公司/地区筛选岗位；点开始可在顶部城市选择器自动选中面板填写的城市，随后先把该城市职位下滑加载到全部（最多约450个），逐个进入详情点「立即沟通」并在聊天页发送自定义招呼语（Enter 发送）；当前批次投完未达本轮上限时自动整页刷新、重新加载新职位继续，投过自动去重，发送后回到开始时的方向与城市，配置本地保存。
 // @author       doubao
 // @match        *://www.zhipin.com/*
 // @match        *://*.zhipin.com/*
@@ -20,6 +20,15 @@
  * 3. 请先登录 BOSS 直聘，搜索就业方向进入「搜索结果列表页」，在右下角悬浮面板配置后点【开始】。
  * 4. 平台每日沟通有数量限制（一般 80~100 次），脚本默认每轮上限 30 次、随机间隔 8~15 秒，可自行下调。
  *
+ * v1.6.0 自动选城市 + 开始即全量加载 + 反复刷新凑满本轮上限：
+ *    - 面板「限定地区」填写城市（如 珠海）后，点【开始】会自动打开顶部城市选择弹窗、切换拼音分组、
+ *      滚动并选中该城市（真机核对：弹窗 .city-select-dialog，分组 .city-char-list li，城市列表 ul.city-list-select），
+ *      选中后页面按 city 城市码整页刷新，列表真正只出该城市职位，不再混入外地；多城市时第一个用 UI 选中，其余文本过滤。
+ *    - 点【开始】并选定城市后，先自动下滑把职位加载到全部（约 450 个或确实加载不动为止）再开始投递，
+ *      而不是投一个才加载，避免同批岗位被漏掉。
+ *    - 本批全量岗位投完仍未达到「本轮上限」时，自动整页刷新列表 → 重新下滑加载 → 去重后投递新出现的岗位，
+ *      如此反复，直到凑满本轮上限；若连续 2 轮刷新都没有任何新岗位可投，则判定该城市已无新职位并停止。
+ *    - 已通过城市选择器锁定城市后，发送返回/刷新都直接回到带 city 城市码的列表 URL，不再点击方向 tab（避免把城市清掉）。
  * v1.5.4 修复地区锁定失效（重要）：
  *    - 修复方向页城市按钮为占位「城市」时，读取逻辑先去掉末尾「市」把「城市」误删成「城」，
  *      导致限定地区变成单字「城」、反而只投地名含「城」的外地岗位（广州科学城/大学城、佛山禅城区等）、
@@ -69,7 +78,9 @@
     salaryRange: null,               // 可选薪资过滤，如 [10, 20] 表示只沟通 10K~20K；null 表示不限
     activeTexts: [],                 // 可选活跃度过滤；空 = 不限
     autoStart: false,                // 建议保持 false，手动点「开始」
-    maxErrorStreak: 3                // 连续失败多少次后自动熔断停止（防止坏链接导致反复横跳）
+    maxErrorStreak: 3,               // 连续失败多少次后自动熔断停止（防止坏链接导致反复横跳）
+    reloadEmptyRounds: 2,            // 本批全量岗位投完后，连续多少轮「整页刷新+重新加载」都没有新岗位可投即停止
+    citySwitchWaitMs: 8000           // 城市选择器选中城市后，等待整页刷新到该城市的超时（毫秒）
   };
 
   /* ================= ② 选择器（2026-09 真机核对；页面改版时优先改这里） ================= */
@@ -100,7 +111,11 @@
     recommendTab: ['a.synthesis', '.expect-select a.synthesis'],
     // —— 顶部所选城市（真机：span.cur-city-label，未选定时显示占位「城市」，弹层 .city-select-dialog）——
     cityLabel: ['.cur-city-label', '.city-label .cur-city-label', '.city-label'],
-    cityDialog: ['.dialog-wrap.city-select-dialog', '.city-select-dialog']
+    cityDialog: ['.dialog-wrap.city-select-dialog', '.city-select-dialog'],
+    // —— 城市选择弹窗（真机核对）：拼音分组 tab=.city-char-list li；城市列表 ul.city-list-select（热门为 ul.city-list），城市项为 li，文本即城市名 ——
+    cityCharTab: '.city-char-list li',
+    cityList: "ul.city-list-select, ul.city-list, ul[class*='city-list']",
+    cityItem: "ul[class*='city-list'] li"
   };
 
   /* ================= ③ 工具函数 ================= */
@@ -242,6 +257,155 @@
     return '';
   }
 
+  /* ================= 城市选择器自动操作（v1.6.0 真机核对） ================= */
+  // 派发「真人」鼠标事件序列（单纯 .click() 在 BOSS 弹窗上偶尔不触发 Vue 监听）
+  function realClick(el) {
+    if (!el) return;
+    var cx = 0, cy = 0;
+    try { var r = el.getBoundingClientRect(); cx = r.left + r.width / 2; cy = r.top + r.height / 2; } catch (e) { }
+    var seq = [
+      ['pointerover', true], ['pointermove', true], ['pointerdown', true],
+      ['mousedown', false], ['pointerup', true], ['mouseup', false], ['click', false]
+    ];
+    for (var i = 0; i < seq.length; i++) {
+      var type = seq[i][0], isPointer = seq[i][1];
+      try {
+        var ev;
+        if (isPointer && window.PointerEvent) {
+          ev = new PointerEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, pointerId: 1, pointerType: 'mouse' });
+        } else {
+          ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy });
+        }
+        el.dispatchEvent(ev);
+      } catch (e) {
+        try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); } catch (e2) { }
+      }
+    }
+  }
+  // 在弹窗当前拼音分组内找到目标城市对应的 <a>（真机结构：li.clearfix>div.list-select-list>a[href=javascript:;]）并点击；返回弹窗是否关闭/城市已切换
+  async function clickCityItem(dlg, want) {
+    function listEl() {
+      var us = $$("ul[class*='city-list']", dlg);
+      for (var k = 0; k < us.length; k++) { if (us[k].offsetHeight > 0) return us[k]; }
+      return us[0] || null;
+    }
+    function anchors() { return $$('.list-select-list a, ul.city-list-select a, ul.city-list a', dlg); }
+    function findAnchor() {
+      var as = anchors();
+      for (var i = 0; i < as.length; i++) {
+        if (cityNameEq(norm(as[i].textContent).replace(/市$/, ''), want)) return as[i];
+      }
+      return null;
+    }
+    for (var attempt = 0; attempt < 6; attempt++) {
+      var ul = listEl();
+      var a = findAnchor();
+      if (!a) return false; // 当前分组 DOM 中没有该城市，交还给外层切下一个分组
+      if (ul) {
+        var ur = ul.getBoundingClientRect(), ar = a.getBoundingClientRect();
+        if (ar.top < ur.top + 8 || ar.bottom > ur.bottom - 8) {
+          try { ul.scrollTop += Math.round(ar.top - ur.top - ul.clientHeight / 2); } catch (e) { }
+          await sleep(380); // 仅在弹窗 ul 内滚动定位，不碰 window；下一轮重新取节点
+          continue;
+        }
+      }
+      if (attempt === 0) log('  点击城市项 <a>' + norm(a.textContent) + '</a>');
+      realClick(a);
+      await sleep(280);
+      var closed = await waitFor(function () { var d = $('.city-select-dialog'); return !(d && d.offsetHeight > 0); }, 1800, 150);
+      if (closed || cityNameEq(readSelectedCity(), want)) return true;
+      await sleep(300); // 弹窗仍开：重新取节点再点
+    }
+    return cityNameEq(readSelectedCity(), want);
+  }
+  // 城市名相等判定：去末尾「市」、去空白；长度≥2 时允许长名包含短名（区县/自治州）
+  function cityNameEq(a, b) {
+    a = String(a || '').replace(/市$/, '').trim();
+    b = String(b || '').replace(/市$/, '').trim();
+    if (!a || !b) return false;
+    if (a === b) return true;
+    return a.length >= 2 && b.length >= 2 && (a.indexOf(b) !== -1 || b.indexOf(a) !== -1);
+  }
+  // 清理列表 URL：保留 city/query，剔除一次性签名/分页/刷新戳参数
+  function cleanListUrl() {
+    try {
+      var u = new URL(location.href, location.origin);
+      ['page', '_security_check', 'seed', 'securityId', 'encryptUserId', 'lid', 'safeguard', 'traceid', 'requestId', '_r'].forEach(function (k) { u.searchParams.delete(k); });
+      return u.href;
+    } catch (e) { return location.href; }
+  }
+  // 打开顶部城市选择弹窗，返回弹窗根元素（失败 null）
+  async function openCityDialog() {
+    var box = $('.city-label') || $('.cur-city-label');
+    if (!box) return null;
+    var dlg = null;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      realClick(box);
+      await waitFor(function () { var d = $('.city-select-dialog'); return d && d.offsetHeight > 0 && isVisible(d); }, 2500, 200);
+      dlg = $('.city-select-dialog');
+      if (dldlgVisible(dlg)) return dlg;
+      await sleep(500);
+    }
+    return null;
+  }
+  function dldlgVisible(d) { return d && d.offsetHeight > 0 && isVisible(d); }
+  // 在城市弹窗中选中目标城市：返回 already / selected / notfound / no-dialog
+  async function selectCity(wantRaw) {
+    var want = String(wantRaw || '').replace(/市$/, '').trim();
+    if (!want) return 'already';
+    if (cityNameEq(readSelectedCity(), want)) return 'already';
+    var dlg = await openCityDialog();
+    if (!dlg) return 'no-dialog';
+    var tabs = $$('.city-char-list li', dlg);
+    log('🏙 城市选择弹窗已打开（' + tabs.length + ' 个分组），查找「' + want + '」…');
+    var anchorSel = '.list-select-list a, ul.city-list-select a, ul.city-list a';
+    for (var ti = 0; ti < tabs.length; ti++) {
+      var tabName = norm(tabs[ti].innerText) || ('第' + (ti + 1) + '组');
+      realClick(tabs[ti]);
+      await waitFor(function () { return $$(anchorSel, dlg).length > 0; }, 1800, 120);
+      await sleep(220);
+      var done = await clickCityItem(dlg, want);
+      if (done) { log('🏙 已在「' + tabName + '」分组选中「' + want + '」，等待页面切换城市…'); return 'selected'; }
+    }
+    log('⚠ 城市弹窗中未找到「' + want + '」（可手动在城市选择器选好后再点开始）');
+    return 'notfound';
+  }
+  // 城市已锁定：固化带 city 的列表 URL 作为返回/刷新地址，之后不再点击方向 tab
+  function lockCity(state) {
+    state.cityLocked = true; state.pendingCity = ''; state.needLoad = true; state.loadedAll = false;
+    state.emptyRounds = 0; state.reloadRound = 0; state.phase = 'list';
+    state.originUrl = cleanListUrl(); state.returnUrl = state.originUrl;
+    saveState(state);
+    log('🏙 已锁定城市：[' + (state.allowAreas.join('/')) + ']，列表只投递该城市岗位');
+    return true;
+  }
+  // 列表页调度前调用：按面板城市在 UI 选中城市；返回 true 表示城市已就绪（已锁定或无需选择）
+  async function ensureCitySelected(state, cfg) {
+    var want = state.pendingCity ? String(state.pendingCity).replace(/市$/, '') : '';
+    if (state.cityLocked) return true;
+    if (!want) return false; // 面板未填城市：不操作 UI，沿用方向 tab 恢复 + 地区文本过滤
+    if (cityNameEq(readSelectedCity(), want)) return lockCity(state);
+    log('🏙 在城市选择器中选择「' + want + '」…');
+    setPanelStatus('🏙 切换城市：' + want);
+    state.phase = 'select-city'; saveState(state);
+    var res = 'no-dialog';
+    try { res = await selectCity(want); } catch (e) { res = 'no-dialog'; }
+    if (res === 'already') return lockCity(state);
+    if (res === 'selected') {
+      // 正常情况下点击城市项会整页刷新（本上下文随之销毁，新页面 boot 会走「当前城市已匹配」分支再次锁定）；
+      // 若页面是局部刷新不重载，则在此等待城市到位后锁定。
+      var ok = await waitFor(function () { return cityNameEq(readSelectedCity(), want); }, cfg.citySwitchWaitMs || 8000, 300);
+      if (ok || cityNameEq(readSelectedCity(), want)) return lockCity(state);
+      // 点击后城市未切换：关掉可能残留的弹窗并安全停止，避免在错误城市/弹窗遮挡下继续刷新或误投
+      try { var x = $('.city-select-dialog .dialog-close') || $('.city-select-dialog .icon-close'); if (x) realClick(x); } catch (e) { }
+      stopRun('已在城市选择器点击「' + want + '」但页面未切换城市，已停止；请手动选好城市后再点【开始】');
+      return false;
+    }
+    log('⚠ 城市选择器未能选中「' + want + '」（' + (res === 'notfound' ? '城市列表中未找到' : '弹窗未打开') + '），改为按地区文本过滤外地岗位');
+    state.cityLocked = false; state.pendingCity = ''; state.phase = 'list'; saveState(state);
+    return false;
+  }
+
   /* ================= 方向 tab（求职期望）读取 / 恢复 ================= */
   // 去掉方向名里的城市括号与空白，用于 tab 匹配：「大模型算法(珠海)」→「大模型算法」
   function directionCoreName(name) {
@@ -350,7 +514,9 @@
       running: false, paused: false, queue: [], page: 1,
       returnUrl: '', originUrl: '', greetedThisRun: 0, stopReason: '',
       currentJobId: null, phase: '', errorStreak: 0, allowAreas: [],
-      directionName: '', directionKind: '', loadedAll: false
+      directionName: '', directionKind: '', loadedAll: false,
+      pendingCity: '', cityLocked: false, needLoad: true,
+      reloadRound: 0, emptyRounds: 0, lastLoadAdded: 0
     };
   }
   function getState() { return Object.assign(defaultState(), lsGet(LS_STATE, {})); }
@@ -497,7 +663,7 @@
     else if (kind === '职位详情页' || kind === '聊天页') setPanelStatus('就绪 · 当前在详情/聊天页，请回到搜索结果页点【开始】');
     else if (kind === '登录页') setPanelStatus('⚠ 未登录：请先登录 BOSS 直聘');
     else setPanelStatus('就绪 · 请登录后搜索岗位，进入搜索结果页');
-    log('脚本已加载 v1.5.4 · 当前：' + kind + ' · ' + location.pathname);
+    log('脚本已加载 v1.6.0 · 当前：' + kind + ' · ' + location.pathname);
   }
 
   function buildBanner() {
@@ -533,25 +699,29 @@
     // 生效地区：面板手动填了用面板；留空则自动读取页面顶部所选城市；方向页城市按钮为占位时，再从方向名括号（如「大模型算法(珠海)」）取城市
     var allowAreas = areaInput.slice();
     if (!allowAreas.length) {
-      var city = readSelectedCity();
-      if (city && city.length < 2) city = ''; // 防御：单字必是占位/噪声（如旧逻辑把「城市」误删成的「城」），不得作为城市
-      if (!city && dir.kind === 'expect') city = cityFromDirectionName(dir.name);
-      if (city) allowAreas = [city];
+      var city0 = readSelectedCity();
+      if (city0 && city0.length < 2) city0 = ''; // 防御：单字必是占位/噪声（如旧逻辑把「城市」误删成的「城」），不得作为城市
+      if (!city0 && dir.kind === 'expect') city0 = cityFromDirectionName(dir.name);
+      if (city0) allowAreas = [city0];
     }
+    // 面板手动填了城市 → 开始时在城市选择器 UI 中选中第一个（真正把列表切到该城市）；留空 → 不操作 UI，仅按地区文本过滤
+    var pendingCity = areaInput.length ? areaInput[0] : '';
     lsSet(LS_PANEL, { keywords: kw, excludeKeywords: exk, excludeCompanies: exc, areas: areaInput, message: msg, maxPerRun: maxPerRun, minDelaySec: minDelaySec, maxDelaySec: maxDelaySec });
     var s = defaultState();
-    s.running = true; s.phase = 'list'; s.page = 1;
+    s.running = true; s.phase = 'init'; s.page = 1;
     s.allowAreas = allowAreas;
+    s.pendingCity = pendingCity;
+    s.cityLocked = false; s.needLoad = true; s.loadedAll = false;
+    s.reloadRound = 0; s.emptyRounds = 0; s.lastLoadAdded = 0;
     s.directionKind = dir.kind;
     s.directionName = dir.kind === 'expect' ? dir.name : '';
-    s.loadedAll = false;
-    // 回退地址：标准搜索页保留 query（职位方向）；求职期望方向页 / 推荐页 URL 不带参数，用干净列表地址 + 运行后点击方向 tab 恢复
+    // 回退地址：标准搜索页保留 query（职位方向）；求职期望方向页 / 推荐页 URL 不带参数，先用干净列表地址，UI 选定城市后会被带 city 码的 URL 覆盖
     s.originUrl = (dir.kind === 'search') ? buildOriginUrl(kw[0]) : (location.origin + '/web/geek/jobs');
     s.returnUrl = s.originUrl;
     saveState(s);
     log('已记录开始页面：' + (dir.kind === 'expect' ? '方向「' + dir.name + '」' : dir.kind === 'search' ? '搜索「' + dir.name + '」' : '推荐页'));
-    log(allowAreas.length ? '限定地区：[' + allowAreas.join(',') + ']，其他城市岗位自动跳过' : '未读取到所选城市，本次不限定地区（可在面板手动填写）');
-    log('▶ 开始：关键词 [' + kw.join(',') + '] 本轮上限 ' + maxPerRun + '，间隔 ' + minDelaySec + '-' + maxDelaySec + 's，投完当前职位后自动下滑加载该方向全部职位');
+    log(allowAreas.length ? '限定地区：[' + allowAreas.join(',') + ']' + (pendingCity ? '（开始时自动在城市选择器选中「' + pendingCity + '」）' : '，其他城市岗位自动跳过') : '未读取到所选城市，本次不限定地区（可在面板手动填写）');
+    log('▶ 开始：关键词 [' + kw.join(',') + '] 本轮上限 ' + maxPerRun + '，间隔 ' + minDelaySec + '-' + maxDelaySec + 's；先选定城市并下滑加载全部职位，再逐个沟通，投完自动刷新找新职位');
     setPanelStatus('运行中…');
     runListLoop();
   }
@@ -657,7 +827,8 @@
     state.queue.forEach(function (e) { if (e.id) seen[e.id] = 1; });
     var lastCount = collectCards().length;
     var same = 0;
-    log('⏬ 当前职位已投完，开始下滑加载该方向全部职位…');
+    var addedTotal = 0;
+    log('⏬ 开始下滑加载该城市全部职位…');
     setPanelStatus('⏬ 下滑加载全部职位中…');
     for (var round = 1; round <= maxRounds; round++) {
       var ss = getState();
@@ -688,21 +859,22 @@
         if (queueHasId(state, p.id)) continue;
         p.done = false; state.queue.push(p); added++;
       }
+      addedTotal += added;
       saveState(state);
       var pendingCount = state.queue.filter(function (e) { return !e.done; }).length;
       setPanelStatus('⏬ 下滑加载中… 已加载 ' + cards.length + ' 个职位，匹配待投 ' + pendingCount + ' 个');
       if (cards.length === lastCount) { same++; } else { same = 0; lastCount = cards.length; }
       if (added > 0) log('第 ' + round + ' 轮：已加载 ' + cards.length + ' 个职位，累计匹配 ' + pendingCount + ' 个待投' + (skippedArea ? '（跳过非[' + cfg.areas.join('/') + '] ' + skippedArea + ' 个）' : ''));
       if (same >= stableRounds) {
-        state.loadedAll = true;
+        state.loadedAll = true; state.lastLoadAdded = addedTotal;
         saveState(state);
-        log('✅ 该方向职位已全部加载（共 ' + cards.length + ' 个），其中 ' + pendingCount + ' 个匹配待投');
+        log('✅ 该城市职位已全部加载（共 ' + cards.length + ' 个），本轮新匹配 ' + addedTotal + ' 个、待投 ' + pendingCount + ' 个');
         return 'done';
       }
     }
-    state.loadedAll = true;
+    state.loadedAll = true; state.lastLoadAdded = addedTotal;
     saveState(state);
-    log('已达滚动保护轮次，停止加载（当前 ' + lastCount + ' 个职位）');
+    log('已达滚动保护轮次，停止加载（当前 ' + lastCount + ' 个职位，新匹配 ' + addedTotal + ' 个）');
     return 'maxround';
   }
 
@@ -718,9 +890,9 @@
     if (state.phase === 'detail' || state.phase === 'chat' || state.phase === 'awaiting-chat') return; // 正在处理某个岗位，列表不抢调度
     _busy = true;
     try {
-      // 0) 等待列表骨架 / 方向 tab 出现
+      // 0) 等待列表骨架 / 方向 tab / 城市按钮出现
       var ready = await waitFor(function () {
-        return $('.job-list-box') || collectCards().length > 0 || $$('a.expect-item').length > 0;
+        return $('.job-list-box') || collectCards().length > 0 || $$('a.expect-item').length > 0 || $('.city-label') || $('.cur-city-label');
       }, 15000);
       if (!ready) {
         var s0 = getState();
@@ -732,51 +904,39 @@
         _busy = false; runListLoop(); return;
       }
 
-      // 0.5) 发送返回后整页会落到默认「推荐」tab：切回开始时记录的方向 tab（搜索页/推荐页无需切换）
-      await restoreDirection(state);
+      // 0.4) v1.6.0 自动选城市：面板填了城市就在顶部城市选择器选中（选中会整页刷新，本上下文可能随之销毁，新页面 boot 会重新进入并锁定）
+      await ensureCitySelected(state, cfg);
+      state = getState();
+      if (!state.running) return; // 城市选择失败已安全停止，不再继续加载/投递
+      cfg.areas = state.allowAreas || [];
+      if (state.phase === 'select-city') return; // 已点击城市、等待整页跳转，由新页面继续
+
+      // 0.6) 恢复方向 tab：仅当未通过城市选择器锁定城市（锁定后列表地址已带 city 城市码，再点方向 tab 会把城市清掉）
+      if (!state.cityLocked) {
+        await restoreDirection(state);
+      }
       await waitFor(function () { return collectCards().length > 0; }, 10000);
       state = getState();
       cfg.areas = state.allowAreas || [];
 
-      // 1) 队列快照优先：已加载并匹配的岗位先逐个投完，投完一个返回列表再取第二个，不丢、不重复
+      // 1) v1.6.0 先全量加载：点开始（或每次整页刷新）后先下滑加载该城市全部职位（约 450 个或确实加载不动）再投递，避免同批漏投
+      if (!state.loadedAll) {
+        var lr0 = await scrollLoadAll(cfg, state);
+        if (lr0 === 'risk' || lr0 === 'stopped') return;
+        state = getState();
+        if (state.lastLoadAdded > 0) state.emptyRounds = 0; // 本轮加载到新匹配，重置「无新职位」计数
+        saveState(state);
+      }
+
+      // 2) 从本地队列取第一个未完成岗位（全量快照后逐个投；投完返回列表直接取下个，不再重复滚动）
       var pending = null, i;
       for (i = 0; i < state.queue.length; i++) if (!state.queue[i].done) { pending = state.queue[i]; break; }
-
-      // 2) 队列空：先把当前已加载卡片扫描入队（优先投当前页这批，符合的投完再下滑，不浪费）
-      if (!pending) {
-        var cards = collectCards(), added = 0, skippedArea = 0;
-        for (var mi = 0; mi < cards.length; mi++) {
-          var pre = parseCard(cards[mi]);
-          var p = matchJob(cards[mi], cfg);
-          if (!p) {
-            if (pre && pre.id && pre.area && cfg.areas.length && !areaMatch(pre, cfg.areas)) skippedArea++;
-            continue;
-          }
-          if (queueHasId(state, p.id)) continue;
-          p.done = false; state.queue.push(p); added++;
-        }
-        state.errorStreak = 0;
-        saveState(state);
-        if (added || skippedArea) log('本页扫描 ' + cards.length + ' 条，新匹配 ' + added + ' 条，待投 ' + state.queue.filter(function (e) { return !e.done; }).length + ' 条' + (skippedArea ? '，跳过非[' + cfg.areas.join('/') + '] ' + skippedArea + ' 个' : ''));
-        for (i = 0; i < state.queue.length; i++) if (!state.queue[i].done) { pending = state.queue[i]; break; }
-      }
-
-      // 3) 当前页符合的已投完、队列仍空 → 自动持续下滑，把该方向全部职位加载出来并增量入队
-      if (!pending) {
-        state = getState();
-        if (!state.loadedAll) {
-          var lr = await scrollLoadAll(cfg, state);
-          if (lr === 'risk' || lr === 'stopped') return;
-          state = getState();
-          for (i = 0; i < state.queue.length; i++) if (!state.queue[i].done) { pending = state.queue[i]; break; }
-        }
-      }
 
       if (pending) {
         state = getState();
         if (state.greetedThisRun >= cfg.maxPerRun) { stopRun('已达本轮上限 ' + cfg.maxPerRun + ' 个岗位'); return; }
         var remain = state.queue.filter(function (e) { return !e.done; }).length;
-        state.returnUrl = state.originUrl || location.href;
+        state.returnUrl = state.originUrl || cleanListUrl();
         state.phase = 'detail'; state.currentJobId = pending.id;
         saveState(state);
         var secs = Math.max(1, Math.round(rand(cfg.minDelaySec, cfg.maxDelaySec)));
@@ -791,13 +951,28 @@
         return;
       }
 
-      // 4) 已全量加载仍无匹配 → 本轮结束
+      // 3) 全量岗位投完仍未达本轮上限 → 整页刷新列表、重新全量加载并去重投递新岗位；连续 N 轮无新岗位则停止
       state = getState();
-      if (state.greetedThisRun > 0) {
-        stopRun('本轮完成：已沟通 ' + state.greetedThisRun + ' 个岗位，该方向已全部加载且没有更多匹配项');
-      } else {
-        stopRun('该方向全部职位中没有符合当前筛选条件的岗位（可调整关键词/屏蔽词/地区后再开始）');
+      if (state.greetedThisRun >= cfg.maxPerRun) { stopRun('已达本轮上限 ' + cfg.maxPerRun + ' 个岗位'); return; }
+      var maxEmpty = cfg.reloadEmptyRounds || 2;
+      if ((state.emptyRounds || 0) >= maxEmpty) {
+        if (state.greetedThisRun > 0) {
+          stopRun('本轮完成：已沟通 ' + state.greetedThisRun + ' 个岗位；连续 ' + maxEmpty + ' 轮刷新都没有新职位，该城市已无更多匹配，停止');
+        } else {
+          stopRun('该城市全部职位中没有符合当前筛选条件的岗位（连续 ' + maxEmpty + ' 轮刷新无新职位，可调关键词/地区后再开始）');
+        }
+        return;
       }
+      state.emptyRounds = (state.emptyRounds || 0) + 1;
+      state.reloadRound = (state.reloadRound || 0) + 1;
+      state.loadedAll = false; state.needLoad = true; state.phase = 'list'; state.errorStreak = 0;
+      var reloadUrl = state.returnUrl || state.originUrl || cleanListUrl();
+      saveState(state);
+      log('🔄 本批职位已处理完，第 ' + state.reloadRound + ' 次整页刷新列表重新加载新职位（连续无新职位 ' + state.emptyRounds + '/' + maxEmpty + ' 后停止）');
+      setPanelStatus('🔄 刷新列表找新职位…');
+      await sleep(1500);
+      location.href = withRefreshStamp(reloadUrl);
+      return;
     } finally {
       _busy = false;
     }
