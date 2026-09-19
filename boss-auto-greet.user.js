@@ -309,6 +309,8 @@
           continue;
         }
       }
+      // 城市项是 <a href="javascript:;">；点击前移除 href，避免触发脚本式导航被页面 CSP 拦截报错（城市跳转由其 Vue 点击处理器完成，与 href 无关）
+      try { if (a.removeAttribute) a.removeAttribute('href'); } catch (e0) { }
       if (attempt === 0) log('  点击城市项 <a>' + norm(a.textContent) + '</a>');
       realClick(a);
       await sleep(280);
