@@ -1,6 +1,6 @@
 /*
  * BOSS直聘 · 定向自动沟通助手  (Edge/Chrome MV3 content script)
- * version 1.6.1  由 boss-auto-greet.user.js 自动生成，请勿直接改本文件（改权威源后重新生成）
+ * version 1.6.2  由 boss-auto-greet.user.js 自动生成，请勿直接改本文件（改权威源后重新生成）
  */
 (function () {
   'use strict';
@@ -571,12 +571,22 @@
     // 输入即保存：关闭面板/浏览器后下次仍保留上次配置
     function savePanelInputs() {
       if (!document.getElementById('bgp-kw') || !document.getElementById('bgp-msg') || !document.getElementById('bgp-max') || !document.getElementById('bgp-exk')) return;
+      var msgEl = document.getElementById('bgp-msg');
+      var newMsg = (msgEl.value || '').trim();
+      var oldMsg = (lsGet(LS_PANEL, {}).message || '').trim();
+      function hasPlaceholder(t) { return /\{(jobName|company|salary)\}/.test(t); }
+      // 模板保护：发送招呼语时 execCommand 偶尔会把「已把 {jobName} 替换成实际职位名」的文本误插进本输入框并触发 input。
+      // 此时焦点不在本框（在聊天框），且新值丢了 {jobName}/{company}/{salary} 占位符——这是串扰污染，不覆盖用户模板。
+      // 用户亲自在本框敲字时焦点一定在本框，不受影响。
+      if (document.activeElement !== msgEl && oldMsg && hasPlaceholder(oldMsg) && !hasPlaceholder(newMsg)) {
+        newMsg = oldMsg;
+      }
       var data = {
         keywords: (divVal('bgp-kw') || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean),
         excludeKeywords: (divVal('bgp-exk') || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean),
         excludeCompanies: (divVal('bgp-exc') || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean),
         areas: (divVal('bgp-area') || '').split(/[,，]/).map(function (s) { return s.trim().replace(/市$/, ''); }).filter(Boolean),
-        message: (divVal('bgp-msg') || '').trim(),
+        message: newMsg,
         maxPerRun: Number(divVal('bgp-max')) || null,
         minDelaySec: Number(divVal('bgp-min')) || null,
         maxDelaySec: Number(divVal('bgp-maxd')) || null
@@ -614,7 +624,7 @@
     else if (kind === '职位详情页' || kind === '聊天页') setPanelStatus('就绪 · 当前在详情/聊天页，请回到搜索结果页点【开始】');
     else if (kind === '登录页') setPanelStatus('⚠ 未登录：请先登录 BOSS 直聘');
     else setPanelStatus('就绪 · 请登录后搜索岗位，进入搜索结果页');
-    log('脚本已加载 v1.6.1 · 当前：' + kind + ' · ' + location.pathname);
+    log('脚本已加载 v1.6.2 · 当前：' + kind + ' · ' + location.pathname);
   }
 
   function buildBanner() {
@@ -1031,6 +1041,15 @@
   // 向 contenteditable / textarea 写入文本，确保 Vue 等框架感知（execCommand + InputEvent 双通道）
   async function setChatText(el, text) {
     if (!el) return false;
+    // 写前先把面板输入框等无关元素的焦点移走，避免 SPA 跳转后焦点暂留面板招呼语框、
+    // 导致 execCommand('insertText') 把已替换的招呼语误插进 #bgp-msg 而污染模板
+    try {
+      var panelMsgs = ['bgp-msg', 'bgp-kw', 'bgp-exk', 'bgp-exc', 'bgp-area', 'bgp-min', 'bgp-max', 'bgp-maxd'];
+      for (var pi = 0; pi < panelMsgs.length; pi++) {
+        var pe = document.getElementById(panelMsgs[pi]);
+        if (pe && document.activeElement === pe) { try { pe.blur(); } catch (e) { } }
+      }
+    } catch (e) { }
     try { el.focus(); } catch (e) { }
     await sleep(60);
 
