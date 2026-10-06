@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘 · 定向自动沟通助手
 // @namespace    doubao-boss-auto-greet
-// @version      1.6.0
+// @version      1.6.1
 // @description  在 BOSS 直聘职位列表页（搜索结果页 / 推荐页的求职期望方向 tab），按关键词/排除词/公司/地区筛选岗位；点开始可在顶部城市选择器自动选中面板填写的城市，随后先把该城市职位下滑加载到全部（最多约450个），逐个进入详情点「立即沟通」并在聊天页发送自定义招呼语（Enter 发送）；当前批次投完未达本轮上限时自动整页刷新、重新加载新职位继续，投过自动去重，发送后回到开始时的方向与城市，配置本地保存。
 // @author       doubao
 // @match        *://www.zhipin.com/*
@@ -372,22 +372,21 @@
     log('⚠ 城市弹窗中未找到「' + want + '」（可手动在城市选择器选好后再点开始）');
     return 'notfound';
   }
-  // 城市已锁定：固化带 city 的列表 URL 作为返回/刷新地址，之后不再点击方向 tab
+  // 城市已就绪：固化加载/批次状态；originUrl 保持 onStart 记录的（带 city 码）地址，不覆盖
   function lockCity(state) {
-    state.cityLocked = true; state.pendingCity = ''; state.needLoad = true; state.loadedAll = false;
+    state.needLoad = true; state.loadedAll = false;
     state.emptyRounds = 0; state.reloadRound = 0; state.phase = 'list';
-    state.originUrl = cleanListUrl(); state.returnUrl = state.originUrl;
     saveState(state);
-    log('🏙 已锁定城市：[' + (state.allowAreas.join('/')) + ']，列表只投递该城市岗位');
+    log('🏙 城市已就位：[' + (state.allowAreas.join('/')) + ']，本批只投递该城市岗位');
     return true;
   }
-  // 列表页调度前调用：按面板城市在 UI 选中城市；返回 true 表示城市已就绪（已锁定或无需选择）
+  // 列表页调度前调用：按开始时记录的目标城市（targetCity，面板优先，否则读用户手动选的城市）在 UI 选中；
+  // 返回 true 表示城市已就绪。注意：点方向 tab 会把 URL 变回裸 jobs、城市按钮变回占位，所以每批刷新后都要重新确认。
   async function ensureCitySelected(state, cfg) {
-    var want = state.pendingCity ? String(state.pendingCity).replace(/市$/, '') : '';
-    if (state.cityLocked) return true;
-    if (!want) return false; // 面板未填城市：不操作 UI，沿用方向 tab 恢复 + 地区文本过滤
+    var want = String(state.targetCity || state.pendingCity || '').replace(/市$/, '').trim();
+    if (!want) return false; // 未记录目标城市：不操作 UI，仅靠地区文本过滤
     if (cityNameEq(readSelectedCity(), want)) return lockCity(state);
-    log('🏙 在城市选择器中选择「' + want + '」…');
+    log('🏙 当前城市为「' + (readSelectedCity() || '（未选）') + '」，在城市选择器中选回「' + want + '」…');
     setPanelStatus('🏙 切换城市：' + want);
     state.phase = 'select-city'; saveState(state);
     var res = 'no-dialog';
@@ -517,7 +516,7 @@
       returnUrl: '', originUrl: '', greetedThisRun: 0, stopReason: '',
       currentJobId: null, phase: '', errorStreak: 0, allowAreas: [],
       directionName: '', directionKind: '', loadedAll: false,
-      pendingCity: '', cityLocked: false, needLoad: true,
+      pendingCity: '', targetCity: '', cityLocked: false, needLoad: true,
       reloadRound: 0, emptyRounds: 0, lastLoadAdded: 0
     };
   }
@@ -665,7 +664,7 @@
     else if (kind === '职位详情页' || kind === '聊天页') setPanelStatus('就绪 · 当前在详情/聊天页，请回到搜索结果页点【开始】');
     else if (kind === '登录页') setPanelStatus('⚠ 未登录：请先登录 BOSS 直聘');
     else setPanelStatus('就绪 · 请登录后搜索岗位，进入搜索结果页');
-    log('脚本已加载 v1.6.0 · 当前：' + kind + ' · ' + location.pathname);
+    log('脚本已加载 v1.6.1 · 当前：' + kind + ' · ' + location.pathname);
   }
 
   function buildBanner() {
@@ -706,23 +705,26 @@
       if (!city0 && dir.kind === 'expect') city0 = cityFromDirectionName(dir.name);
       if (city0) allowAreas = [city0];
     }
-    // 面板手动填了城市 → 开始时在城市选择器 UI 中选中第一个（真正把列表切到该城市）；留空 → 不操作 UI，仅按地区文本过滤
-    var pendingCity = areaInput.length ? areaInput[0] : '';
+    // 目标城市：面板填了用面板第一个；留空则沿用 allowAreas 已读出的「页面当前所选城市」（用户手动在页面选的城市）。
+    // 刷新后方向会掉回推荐、点方向又会清掉城市，所以每批都要靠 targetCity 在城市弹窗里重新选回它。
+    var targetCity = allowAreas.length ? allowAreas[0] : '';
     lsSet(LS_PANEL, { keywords: kw, excludeKeywords: exk, excludeCompanies: exc, areas: areaInput, message: msg, maxPerRun: maxPerRun, minDelaySec: minDelaySec, maxDelaySec: maxDelaySec });
     var s = defaultState();
     s.running = true; s.phase = 'init'; s.page = 1;
     s.allowAreas = allowAreas;
-    s.pendingCity = pendingCity;
+    s.pendingCity = targetCity;
+    s.targetCity = targetCity;
     s.cityLocked = false; s.needLoad = true; s.loadedAll = false;
     s.reloadRound = 0; s.emptyRounds = 0; s.lastLoadAdded = 0;
     s.directionKind = dir.kind;
     s.directionName = dir.kind === 'expect' ? dir.name : '';
-    // 回退地址：标准搜索页保留 query（职位方向）；求职期望方向页 / 推荐页 URL 不带参数，先用干净列表地址，UI 选定城市后会被带 city 码的 URL 覆盖
-    s.originUrl = (dir.kind === 'search') ? buildOriginUrl(kw[0]) : (location.origin + '/web/geek/jobs');
+    // 回退/刷新地址：直接用开始时的干净列表 URL（保留 city 码与 query）；整页刷新后方向会掉回推荐，
+    // 由 runListLoop 每批开头自动点回开始时的方向 tab、再在城市弹窗选回 targetCity，不必把方向/城市硬编码进 URL。
+    s.originUrl = cleanListUrl();
     s.returnUrl = s.originUrl;
     saveState(s);
     log('已记录开始页面：' + (dir.kind === 'expect' ? '方向「' + dir.name + '」' : dir.kind === 'search' ? '搜索「' + dir.name + '」' : '推荐页'));
-    log(allowAreas.length ? '限定地区：[' + allowAreas.join(',') + ']' + (pendingCity ? '（开始时自动在城市选择器选中「' + pendingCity + '」）' : '，其他城市岗位自动跳过') : '未读取到所选城市，本次不限定地区（可在面板手动填写）');
+    log(allowAreas.length ? '限定地区：[' + allowAreas.join(',') + ']' + (targetCity ? '（已记录，每批刷新后自动在城市选择器选回「' + targetCity + '」）' : '，其他城市岗位自动跳过') : '未读取到所选城市，本次不限定地区（可在面板手动填写）');
     log('▶ 开始：关键词 [' + kw.join(',') + '] 本轮上限 ' + maxPerRun + '，间隔 ' + minDelaySec + '-' + maxDelaySec + 's；先选定城市并下滑加载全部职位，再逐个沟通，投完自动刷新找新职位');
     setPanelStatus('运行中…');
     runListLoop();
@@ -906,28 +908,31 @@
         _busy = false; runListLoop(); return;
       }
 
-      // 0.4) v1.6.0 自动选城市：面板填了城市就在顶部城市选择器选中（选中会整页刷新，本上下文可能随之销毁，新页面 boot 会重新进入并锁定）
-      await ensureCitySelected(state, cfg);
-      state = getState();
-      if (!state.running) return; // 城市选择失败已安全停止，不再继续加载/投递
-      cfg.areas = state.allowAreas || [];
-      if (state.phase === 'select-city') return; // 已点击城市、等待整页跳转，由新页面继续
-
-      // 0.6) 恢复方向 tab：仅当未通过城市选择器锁定城市（锁定后列表地址已带 city 城市码，再点方向 tab 会把城市清掉）
-      if (!state.cityLocked) {
-        await restoreDirection(state);
-      }
-      await waitFor(function () { return collectCards().length > 0; }, 10000);
-      state = getState();
-      cfg.areas = state.allowAreas || [];
-
-      // 1) v1.6.0 先全量加载：点开始（或每次整页刷新）后先下滑加载该城市全部职位（约 450 个或确实加载不动）再投递，避免同批漏投
-      if (!state.loadedAll) {
-        var lr0 = await scrollLoadAll(cfg, state);
-        if (lr0 === 'risk' || lr0 === 'stopped') return;
+      // 0.4) 判断是否「新一批」：queue 里还有未投完的岗位 → 连续投递中，直接跳过方向/城市恢复与全量加载，进下一个详情；
+      //      只有 queue 空了（本批投完）才做一次：先点回开始时的方向 tab，再选回城市，然后全量加载新一批。
+      var hasPending = false;
+      for (var hi = 0; hi < state.queue.length; hi++) if (!state.queue[hi].done) { hasPending = true; break; }
+      if (!hasPending) {
+        // 先点回开始时的方向 tab（刷新后方向会掉回推荐；点方向是 SPA，会把 URL 变裸 jobs、城市按钮变回占位）
+        if (state.directionName && state.directionKind === 'expect') {
+          await restoreDirection(state);
+        }
+        // 再选回目标城市（点城市会整页刷新；新页面 boot 后方向保持、城市到位）
+        await ensureCitySelected(state, cfg);
         state = getState();
-        if (state.lastLoadAdded > 0) state.emptyRounds = 0; // 本轮加载到新匹配，重置「无新职位」计数
-        saveState(state);
+        if (!state.running) return; // 城市选择失败已安全停止
+        cfg.areas = state.allowAreas || [];
+        if (state.phase === 'select-city') return; // 已点击城市、等待整页跳转，由新页面继续
+        await waitFor(function () { return collectCards().length > 0; }, 10000);
+        state = getState();
+        cfg.areas = state.allowAreas || [];
+        if (!state.loadedAll) {
+          var lr0 = await scrollLoadAll(cfg, state);
+          if (lr0 === 'risk' || lr0 === 'stopped') return;
+          state = getState();
+          if (state.lastLoadAdded > 0) state.emptyRounds = 0; // 本轮加载到新匹配，重置「无新职位」计数
+          saveState(state);
+        }
       }
 
       // 2) 从本地队列取第一个未完成岗位（全量快照后逐个投；投完返回列表直接取下个，不再重复滚动）
