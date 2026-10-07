@@ -1,6 +1,6 @@
 /*
  * BOSS直聘 · 定向自动沟通助手  (Edge/Chrome MV3 content script)
- * version 1.6.2  由 boss-auto-greet.user.js 自动生成，请勿直接改本文件（改权威源后重新生成）
+ * version 1.6.3  由 boss-auto-greet.user.js 自动生成，请勿直接改本文件（改权威源后重新生成）
  */
 (function () {
   'use strict';
@@ -575,10 +575,11 @@
       var newMsg = (msgEl.value || '').trim();
       var oldMsg = (lsGet(LS_PANEL, {}).message || '').trim();
       function hasPlaceholder(t) { return /\{(jobName|company|salary)\}/.test(t); }
-      // 模板保护：发送招呼语时 execCommand 偶尔会把「已把 {jobName} 替换成实际职位名」的文本误插进本输入框并触发 input。
-      // 此时焦点不在本框（在聊天框），且新值丢了 {jobName}/{company}/{salary} 占位符——这是串扰污染，不覆盖用户模板。
-      // 用户亲自在本框敲字时焦点一定在本框，不受影响。
-      if (document.activeElement !== msgEl && oldMsg && hasPlaceholder(oldMsg) && !hasPlaceholder(newMsg)) {
+      // 模板保护：招呼语模板一定带 {jobName}/{company}/{salary} 占位符。
+      // 发送时 execCommand 偶尔把「已把占位符替换成具体职位名」的文本误插进本框并触发 input，
+      // 此时新值恰好丢光了所有占位符——这就是污染，不是用户本意，保留旧模板。
+      // 用户在框里敲的新模板同样带占位符，不会被误伤；从已污染状态重新敲回带占位符的模板也能自愈。
+      if (hasPlaceholder(oldMsg) && !hasPlaceholder(newMsg)) {
         newMsg = oldMsg;
       }
       var data = {
@@ -624,7 +625,7 @@
     else if (kind === '职位详情页' || kind === '聊天页') setPanelStatus('就绪 · 当前在详情/聊天页，请回到搜索结果页点【开始】');
     else if (kind === '登录页') setPanelStatus('⚠ 未登录：请先登录 BOSS 直聘');
     else setPanelStatus('就绪 · 请登录后搜索岗位，进入搜索结果页');
-    log('脚本已加载 v1.6.2 · 当前：' + kind + ' · ' + location.pathname);
+    log('脚本已加载 v1.6.3 · 当前：' + kind + ' · ' + location.pathname);
   }
 
   function buildBanner() {
@@ -668,7 +669,10 @@
     // 目标城市：面板填了用面板第一个；留空则沿用 allowAreas 已读出的「页面当前所选城市」（用户手动在页面选的城市）。
     // 刷新后方向会掉回推荐、点方向又会清掉城市，所以每批都要靠 targetCity 在城市弹窗里重新选回它。
     var targetCity = allowAreas.length ? allowAreas[0] : '';
-    lsSet(LS_PANEL, { keywords: kw, excludeKeywords: exk, excludeCompanies: exc, areas: areaInput, message: msg, maxPerRun: maxPerRun, minDelaySec: minDelaySec, maxDelaySec: maxDelaySec });
+    // 保存面板配置；招呼语保留用户在面板里实时编辑并保存的模板（savedPanel.message），
+    // 不用 onStart 瞬间输入框里的值覆盖，避免污染值经此路径写回
+    var savedPanel = lsGet(LS_PANEL, {});
+    lsSet(LS_PANEL, { keywords: kw, excludeKeywords: exk, excludeCompanies: exc, areas: areaInput, message: savedPanel.message || msg, maxPerRun: maxPerRun, minDelaySec: minDelaySec, maxDelaySec: maxDelaySec });
     var s = defaultState();
     s.running = true; s.phase = 'init'; s.page = 1;
     s.allowAreas = allowAreas;
